@@ -1,3 +1,8 @@
+#
+# OtterTune - factor_analysis.py
+#
+# Copyright (c) 2017-18, Carnegie Mellon University Database Group
+#
 '''
 Created on Jul 4, 2016
 
@@ -43,7 +48,12 @@ class FactorAnalysis(ModelBase):
     """
 
     def __init__(self):
-        self._reset()
+        self.model_ = None
+        self.components_ = None
+        self.feature_labels_ = None
+        self.total_variance_ = None
+        self.pvars_ = None
+        self.pvars_noise_ = None
 
     def _reset(self):
         """Resets all attributes (erases the model)"""
@@ -54,7 +64,7 @@ class FactorAnalysis(ModelBase):
         self.pvars_ = None
         self.pvars_noise_ = None
 
-    def fit(self, X, feature_labels=None, estimator_params=None):
+    def fit(self, X, feature_labels=None, n_components=None, estimator_params=None):
         """Fits an Sklearn FA model to X.
 
         Parameters
@@ -77,7 +87,11 @@ class FactorAnalysis(ModelBase):
         if feature_labels is None:
             feature_labels = ["feature_{}".format(i) for i in range(X.shape[1])]
         self.feature_labels_ = feature_labels
-        self.model_ = SklearnFactorAnalysis()
+        if n_components is not None:
+            model = SklearnFactorAnalysis(n_components=n_components)
+        else:
+            model = SklearnFactorAnalysis()
+        self.model_ = model
         if estimator_params is not None:
             # Update Sklearn estimator params
             assert isinstance(estimator_params, dict)

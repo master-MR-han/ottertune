@@ -1,3 +1,8 @@
+#
+# OtterTune - utils.py
+#
+# Copyright (c) 2017-18, Carnegie Mellon University Database Group
+#
 '''
 Created on Jul 8, 2017
 
@@ -6,14 +11,16 @@ Created on Jul 8, 2017
 
 import json
 import logging
-import numpy as np
 import string
 from collections import OrderedDict
 from random import choice
+
+import numpy as np
 from django.utils.text import capfirst
 from djcelery.models import TaskMeta
 
-from .types import LabelStyleType
+from .types import LabelStyleType, VarType
+from .models import KnobCatalog, DBMSCatalog
 
 LOG = logging.getLogger(__name__)
 
@@ -36,7 +43,7 @@ class JSONUtil(object):
                 config = sorted(config)
 
         return json.dumps(config,
-                          encoding="UTF-8",
+                          ensure_ascii=False,
                           indent=indent)
 
 
@@ -54,10 +61,15 @@ class TaskUtil(object):
     @staticmethod
     def get_tasks(tasks):
         if not tasks:
-           return []
+            return []
         task_ids = tasks.split(',')
-        return list(TaskMeta.objects.filter(task_id__in=task_ids))
-
+        res = []
+        for task_id in task_ids:
+            task = TaskMeta.objects.filter(task_id=task_id)
+            if len(task) == 0:
+                continue  # Task Not Finished
+            res.append(task[0])
+        return res
 
     @staticmethod
     def get_task_status(tasks):
@@ -82,8 +94,8 @@ class DataUtil(object):
 
     @staticmethod
     def aggregate_data(results):
-        knob_labels = JSONUtil.loads(results[0].knob_data.data).keys()
-        metric_labels = JSONUtil.loads(results[0].metric_data.data).keys()
+        knob_labels = list(JSONUtil.loads(results[0].knob_data.data).keys())
+        metric_labels = list(JSONUtil.loads(results[0].metric_data.data).keys())
         X_matrix = np.empty((len(results), len(knob_labels)), dtype=float)
         y_matrix = np.empty((len(results), len(metric_labels)), dtype=float)
         rowlabels = np.empty(len(results), dtype=int)
@@ -122,6 +134,9 @@ class DataUtil(object):
         num_unique = X_unique.shape[0]
         if num_unique == X_matrix.shape[0]:
             # No duplicate rows
+
+            # For consistency, tuple the rowlabels
+            rowlabels = np.array([tuple([x]) for x in rowlabels])  # pylint: disable=bad-builtin,deprecated-lambda
             return X_matrix, y_matrix, rowlabels
 
         # Combine duplicate rows
@@ -138,6 +153,55 @@ class DataUtil(object):
                 rowlabels_unique[i] = tuple(rowlabels[dup_idxs])
         return X_unique, y_unique, rowlabels_unique
 
+    @staticmethod
+    def dummy_encoder_helper(featured_knobs, dbms):
+        n_values = []
+        cat_knob_indices = []
+        cat_knob_names = []
+        noncat_knob_names = []
+        binary_knob_indices = []
+        dbms_info = DBMSCatalog.objects.filter(pk=dbms.pk)
+
+        if len(dbms_info) == 0:
+            raise Exception("DBMSCatalog cannot find dbms {}".format(dbms.full_name()))
+        full_dbms_name = dbms_info[0]
+
+        for i, knob_name in enumerate(featured_knobs):
+            # knob can be uniquely identified by (dbms, knob_name)
+            knobs = KnobCatalog.objects.filter(name=knob_name,
+                                               dbms=dbms)
+            if len(knobs) == 0:
+                raise Exception(
+                    "KnobCatalog cannot find knob of name {} in {}".format(
+                        knob_name, full_dbms_name))
+            knob = knobs[0]
+            # check if knob is ENUM
+            if knob.vartype == VarType.ENUM:
+                # enumvals is a comma delimited list
+                enumvals = knob.enumvals.split(",")
+                if len(enumvals) > 2:
+                    # more than 2 values requires dummy encoding
+                    n_values.append(len(enumvals))
+                    cat_knob_indices.append(i)
+                    cat_knob_names.append(knob_name)
+                else:
+                    # knob is binary
+                    noncat_knob_names.append(knob_name)
+                    binary_knob_indices.append(i)
+            else:
+                if knob.vartype == VarType.BOOL:
+                    binary_knob_indices.append(i)
+                noncat_knob_names.append(knob_name)
+
+        n_values = np.array(n_values)
+        cat_knob_indices = np.array(cat_knob_indices)
+        categorical_info = {'n_values': n_values,
+                            'categorical_features': cat_knob_indices,
+                            'cat_columnlabels': cat_knob_names,
+                            'noncat_columnlabels': noncat_knob_names,
+                            'binary_vars': binary_knob_indices}
+        return categorical_info
+
 
 class ConversionUtil(object):
 
@@ -148,7 +212,10 @@ class ConversionUtil(object):
                 if len(value) == len(suffix):
                     amount = 1
                 else:
-                    amount = int(value[:-len(suffix)])
+                    try:
+                        amount = int(value[:-len(suffix)])
+                    except ValueError:
+                        continue
                 return amount * factor
         return None
 
@@ -163,7 +230,7 @@ class LabelUtil(object):
     @staticmethod
     def style_labels(label_map, style=LabelStyleType.DEFAULT_STYLE):
         style_labels = {}
-        for name, verbose_name in label_map.iteritems():
+        for name, verbose_name in list(label_map.items()):
             if style == LabelStyleType.TITLE:
                 label = verbose_name.title()
             elif style == LabelStyleType.CAPFIRST:
@@ -175,5 +242,5 @@ class LabelUtil(object):
             if style != LabelStyleType.LOWER and 'dbms' in label.lower():
                 label = label.replace('dbms', 'DBMS')
                 label = label.replace('Dbms', 'DBMS')
-            style_labels[name] = label
+            style_labels[name] = str(label)
         return style_labels

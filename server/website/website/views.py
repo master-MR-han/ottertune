@@ -1,13 +1,19 @@
+#
+# OtterTune - views.py
+#
+# Copyright (c) 2017-18, Carnegie Mellon University Database Group
+#
 import logging
-
+import datetime
 from collections import OrderedDict
-from pytz import timezone
 
 from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
+from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import ObjectDoesNotExist
-from django.http import Http404, HttpResponse, QueryDict
+from django.http import HttpResponse, QueryDict
 from django.shortcuts import redirect, render, get_object_or_404
 from django.template.context_processors import csrf
 from django.template.defaultfilters import register
@@ -15,20 +21,21 @@ from django.urls import reverse, reverse_lazy
 from django.utils.datetime_safe import datetime
 from django.utils.timezone import now
 from django.views.decorators.csrf import csrf_exempt
+from pytz import timezone
 
 from .forms import NewResultForm, ProjectForm, SessionForm
 from .models import (BackupData, DBMSCatalog, Hardware, KnobCatalog,
                      KnobData, MetricCatalog, MetricData, MetricManager,
                      Project, Result, Session, Workload)
 from .parser import Parser
-from tasks import (aggregate_target_results,
-                   map_workload,
-                   configuration_recommendation)
+from .tasks import (aggregate_target_results, map_workload,
+                    configuration_recommendation)
 from .types import (DBMSType, HardwareType, KnobUnitType, MetricType,
                     TaskType, VarType)
 from .utils import JSONUtil, LabelUtil, MediaUtil, TaskUtil
+from .settings import TIME_ZONE
 
-log = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 # For the html template to access dict object
@@ -51,15 +58,30 @@ def signup_view(request):
             request.POST = new_post
             return login_view(request)
         else:
-            log.warn(form.is_valid())
-            log.warn(form.errors)
+            LOG.warning("Signup form is not valid: %s", str(form.errors))
     else:
         form = UserCreationForm()
     token = {}
     token.update(csrf(request))
     token['form'] = form
-
     return render(request, 'signup.html', token)
+
+
+def change_password_view(request):
+    if not request.user.is_authenticated():
+        return redirect(reverse('home_project'))
+    if request.method == 'POST':
+        form = PasswordChangeForm(request.user, request.POST)
+        if form.is_valid():
+            user = form.save()
+            update_session_auth_hash(request, user)
+            return redirect(reverse('home_projects'))
+    else:
+        form = PasswordChangeForm(request.user)
+    token = {}
+    token.update(csrf(request))
+    token['form'] = form
+    return render(request, 'change_password.html', token)
 
 
 def login_view(request):
@@ -72,14 +94,12 @@ def login_view(request):
             login(request, form.get_user())
             return redirect(reverse('home_projects'))
         else:
-            log.info("Invalid request: {}".format(
-                ', '.join(form.error_messages)))
+            LOG.warning("Login form is not valid: %s", str(form.errors))
     else:
         form = AuthenticationForm()
     token = {}
     token.update(csrf(request))
     token['form'] = form
-
     return render(request, 'login.html', token)
 
 
@@ -90,7 +110,7 @@ def logout_view(request):
 
 
 @login_required(login_url=reverse_lazy('login'))
-def redirect_home(request):
+def redirect_home(request):  # pylint: disable=unused-argument
     return redirect(reverse('home_projects'))
 
 
@@ -119,7 +139,7 @@ def create_or_edit_project(request, project_id=''):
         if project_id == '':
             form = ProjectForm(request.POST)
             if not form.is_valid():
-                return HttpResponse(str(form))
+                return render(request, 'edit_project.html', {'form': form})
             project = form.save(commit=False)
             project.user = request.user
             ts = now()
@@ -127,11 +147,10 @@ def create_or_edit_project(request, project_id=''):
             project.last_update = ts
             project.save()
         else:
-            project = get_object_or_404(Project, pk=project_id,
-                                                 user=request.user)
+            project = get_object_or_404(Project, pk=project_id, user=request.user)
             form = ProjectForm(request.POST, instance=project)
             if not form.is_valid():
-                return HttpResponse(str(form))
+                return render(request, 'edit_project.html', {'form': form})
             project.last_update = now()
             project.save()
         return redirect(reverse('project_sessions', kwargs={'project_id': project.pk}))
@@ -186,21 +205,28 @@ def session_view(request, project_id, session_id):
     # Group the session's results by DBMS & workload
     dbmss = {}
     workloads = {}
+    dbmss_ids = set()
+    workloads_ids = set()
     for res in results:
-        dbmss[res.dbms.key] = res.dbms
-        workload_name = res.workload.name
-        if workload_name not in workloads:
-            workloads[workload_name] = set()
-        workloads[workload_name].add(res.workload)
+        if res.dbms_id not in dbmss_ids:
+            dbmss_ids.add(res.dbms_id)
+            res_dbms = res.dbms
+            dbmss[res_dbms.key] = res_dbms
+
+        if res.workload_id not in workloads_ids:
+            workloads_ids.add(res.workload_id)
+            res_workload = res.workload
+            workloads[res_workload.name] = set()
+            workloads[res_workload.name].add(res_workload)
 
     # Sort so names will be ordered in the sidebar
-    workloads = OrderedDict([(k, sorted(list(v))) for \
-                             k, v in sorted(workloads.iteritems())])
+    workloads = OrderedDict([(k, sorted(list(v))) for
+                             k, v in sorted(workloads.items())])
     dbmss = OrderedDict(sorted(dbmss.items()))
 
     if len(workloads) > 0:
         # Set the default workload to whichever is first
-        default_workload, default_confs = workloads.iteritems().next()
+        default_workload, default_confs = next(iter(list(workloads.items())))
         default_confs = ','.join([str(c.pk) for c in default_confs])
     else:
         # Set the default to display nothing if there are no results yet
@@ -208,7 +234,7 @@ def session_view(request, project_id, session_id):
         default_confs = 'none'
 
     default_metrics = MetricCatalog.objects.get_default_metrics(session.target_objective)
-    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, True)
+    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, session.target_objective)
 
     form_labels = Session.get_labels()
     form_labels['title'] = "Session Info"
@@ -216,13 +242,13 @@ def session_view(request, project_id, session_id):
         'project': project,
         'dbmss': dbmss,
         'workloads': workloads,
-        'results_per_page': [10, 50, 100],
+        'results_per_page': [10, 50, 100, 500, 1000],
         'default_dbms': session.dbms.key,
         'default_results_per_page': 10,
         'default_equidistant': "on",
         'default_workload': default_workload,
         'defaultspe': default_confs,
-        'metrics': metric_meta.keys(),
+        'metrics': list(metric_meta.keys()),
         'metric_meta': metric_meta,
         'default_metrics': default_metrics,
         'filters': [],
@@ -242,7 +268,8 @@ def create_or_edit_session(request, project_id, session_id=''):
             # Create a new session from the form contents
             form = SessionForm(request.POST)
             if not form.is_valid():
-                return HttpResponse(str(form))
+                return render(request, 'edit_session.html',
+                              {'project': project, 'form': form})
             session = form.save(commit=False)
             session.user = request.user
             session.project = project
@@ -256,7 +283,8 @@ def create_or_edit_session(request, project_id, session_id=''):
             session = Session.objects.get(pk=session_id)
             form = SessionForm(request.POST, instance=session)
             if not form.is_valid():
-                return HttpResponse(str(form))
+                return render(request, 'edit_session.html',
+                              {'project': project, 'form': form, 'session': session})
             if form.cleaned_data['gen_upload_code'] is True:
                 session.upload_code = MediaUtil.upload_code_generator()
             session.last_update = now()
@@ -302,7 +330,7 @@ def result_view(request, project_id, session_id, result_id):
     session = target.session
 
     default_metrics = MetricCatalog.objects.get_default_metrics(session.target_objective)
-    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, True)
+    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, session.target_objective)
     metric_data = JSONUtil.loads(target.metric_data.data)
 
     default_metrics = {mname: metric_data[mname] * metric_meta[mname].scale
@@ -340,40 +368,39 @@ def new_result(request):
         form = NewResultForm(request.POST, request.FILES)
 
         if not form.is_valid():
-            log.warning("Form is not valid:\n" + str(form))
-            return HttpResponse("Form is not valid\n" + str(form))
+            LOG.warning("New result form is not valid: %s", str(form.errors))
+            return HttpResponse("New result form is not valid: " + str(form.errors))
         upload_code = form.cleaned_data['upload_code']
         try:
             session = Session.objects.get(upload_code=upload_code)
         except Session.DoesNotExist:
-            log.warning("Wrong upload code: " + upload_code)
-            return HttpResponse("wrong upload_code!")
+            LOG.warning("Invalid upload code: %s", upload_code)
+            return HttpResponse("Invalid upload code: " + upload_code)
 
         return handle_result_files(session, request.FILES)
-    log.warning("Request type was not POST")
+    LOG.warning("Request type was not POST")
     return HttpResponse("Request type was not POST")
 
 
 def handle_result_files(session, files):
     from celery import chain
-
     # Combine into contiguous files
-    files = {k: ''.join(v.chunks()) for k, v in files.iteritems()}
+    files = {k: b''.join(v.chunks()).decode() for k, v in list(files.items())}
 
     # Load the contents of the controller's summary file
     summary = JSONUtil.loads(files['summary'])
-    dbms_type = DBMSType.type(summary['database_type']) 
-   # dbms_version = Parser.parse_version_string(dbms_type, summary['database_version'])
-   # dbms_version = '9.6'  ## FIXME (dva)
-    dbms_version = summary['database_version'] ##TODO parse_version_string 
+    dbms_type = DBMSType.type(summary['database_type'])
+    dbms_version = summary['database_version']  # TODO: fix parse_version_string
     workload_name = summary['workload_name']
     observation_time = summary['observation_time']
     start_time = datetime.fromtimestamp(
-        int(summary['start_time']) / 1000,
-        timezone("UTC"))
+        # int(summary['start_time']), # unit: seconds
+        int(summary['start_time']) / 1000,  # unit: ms
+        timezone(TIME_ZONE))
     end_time = datetime.fromtimestamp(
-        int(summary['end_time']) / 1000,
-        timezone("UTC"))
+        # int(summary['end_time']), # unit: seconds
+        int(summary['end_time']) / 1000,  # unit: ms
+        timezone(TIME_ZONE))
     try:
         # Check that we support this DBMS and version
         dbms = DBMSCatalog.objects.get(
@@ -399,14 +426,14 @@ def handle_result_files(session, files):
 
     # Load, process, and store the runtime metrics exposed by the DBMS
     initial_metric_dict, initial_metric_diffs = Parser.parse_dbms_metrics(
-            dbms.pk, JSONUtil.loads(files['metrics_before']))
+        dbms.pk, JSONUtil.loads(files['metrics_before']))
     final_metric_dict, final_metric_diffs = Parser.parse_dbms_metrics(
-            dbms.pk, JSONUtil.loads(files['metrics_after']))
+        dbms.pk, JSONUtil.loads(files['metrics_after']))
     metric_dict = Parser.calculate_change_in_metrics(
         dbms.pk, initial_metric_dict, final_metric_dict)
     initial_metric_diffs.extend(final_metric_diffs)
     numeric_metric_dict = Parser.convert_dbms_metrics(
-        dbms.pk, metric_dict, observation_time)
+        dbms.pk, metric_dict, observation_time, session.target_objective)
     metric_data = MetricData.objects.create_metric_data(
         session, JSONUtil.dumps(metric_dict, pprint=True, sort=True),
         JSONUtil.dumps(numeric_metric_dict, pprint=True, sort=True), dbms)
@@ -443,20 +470,21 @@ def handle_result_files(session, files):
     if session.tuning_session is False:
         return HttpResponse("Result stored successfully!")
 
+    result_id = result.pk
     response = chain(aggregate_target_results.s(result.pk),
                      map_workload.s(),
                      configuration_recommendation.s()).apply_async()
     taskmeta_ids = [response.parent.parent.id, response.parent.id, response.id]
     result.task_ids = ','.join(taskmeta_ids)
     result.save()
-    return HttpResponse("Result stored successfully! Running tuner... (status={})".format(
-        response.status))
+    return HttpResponse("Result stored successfully! Running tuner...(status={})  Result ID:{} "
+                        .format(response.status, result_id))
 
 
 @login_required(login_url=reverse_lazy('login'))
 def dbms_knobs_reference(request, dbms_name, version, knob_name):
     knob = get_object_or_404(KnobCatalog, dbms__type=DBMSType.type(dbms_name),
-                              dbms__version=version, name=knob_name)
+                             dbms__version=version, name=knob_name)
     labels = KnobCatalog.get_labels()
     list_items = OrderedDict()
     if knob.category is not None:
@@ -478,7 +506,7 @@ def dbms_knobs_reference(request, dbms_name, version, knob_name):
         if knob.description is not None:
             description += knob.description
         list_items[labels['summary']] = description
-    
+
     context = {
         'title': knob.name,
         'dbms': knob.dbms,
@@ -510,7 +538,7 @@ def dbms_metrics_reference(request, dbms_name, version, metric_name):
 
 
 @login_required(login_url=reverse_lazy('login'))
-def knob_data_view(request, project_id, session_id, data_id):
+def knob_data_view(request, project_id, session_id, data_id):  # pylint: disable=unused-argument
     knob_data = get_object_or_404(KnobData, pk=data_id)
     labels = KnobData.get_labels()
     labels.update(LabelUtil.style_labels({
@@ -526,7 +554,7 @@ def knob_data_view(request, project_id, session_id, data_id):
 
 
 @login_required(login_url=reverse_lazy('login'))
-def metric_data_view(request, project_id, session_id, data_id):
+def metric_data_view(request, project_id, session_id, data_id):  # pylint: disable=unused-argument
     metric_data = get_object_or_404(MetricData, pk=data_id)
     labels = MetricData.get_labels()
     labels.update(LabelUtil.style_labels({
@@ -563,16 +591,16 @@ def dbms_data_view(request, context, dbms_data):
         comp_dict = JSONUtil.loads(comp_data)
         comp_featured_dict = filter_fn(dbms_id, comp_dict)
 
-        all_data = [(k, v, comp_dict[k]) for k, v in all_data_dict.iteritems()]
+        all_data = [(k, v, comp_dict[k]) for k, v in list(all_data_dict.items())]
         featured_data = [(k, v, comp_featured_dict[k])
-                         for k, v in featured_dict.iteritems()]
+                         for k, v in list(featured_dict.items())]
     else:
         comp_id = None
-        all_data = list(all_data_dict.iteritems())
-        featured_data = list(featured_dict.iteritems())
+        all_data = list(all_data_dict.items())
+        featured_data = list(featured_dict.items())
     peer_data = model_class.objects.filter(
         dbms=dbms_data.dbms, session=dbms_data.session)
-    peer_data = filter(lambda peer: peer.pk != dbms_data.pk, peer_data)
+    peer_data = [peer for peer in peer_data if peer.pk != dbms_data.pk]
 
     context['all_data'] = all_data
     context['featured_data'] = featured_data
@@ -583,7 +611,7 @@ def dbms_data_view(request, context, dbms_data):
 
 
 @login_required(login_url=reverse_lazy('login'))
-def workload_view(request, project_id, session_id, wkld_id):
+def workload_view(request, project_id, session_id, wkld_id):  # pylint: disable=unused-argument
     workload = get_object_or_404(Workload, pk=wkld_id)
     session = get_object_or_404(Session, pk=session_id)
 
@@ -591,19 +619,17 @@ def workload_view(request, project_id, session_id, wkld_id):
                                          session=session)
     knob_conf_map = {}
     for conf in knob_confs:
-        latest_result = Result.objects.filter(session=session,
-                                              knob_data=conf,
-                                              workload=workload).\
-                                       order_by('-observation_end_time').\
-                                       first()
+        latest_result = Result.objects.filter(
+            session=session, knob_data=conf, workload=workload).order_by(
+                '-observation_end_time').first()
         if not latest_result:
             continue
         knob_conf_map[conf.name] = [conf, latest_result]
-    knob_conf_map = OrderedDict(sorted(knob_conf_map.items(), key=lambda x: x[1][0].pk))
-    default_knob_confs = [c for c, _ in knob_conf_map.values()][:5]
-    log.debug("default_knob_confs: %s" % default_knob_confs)
+    knob_conf_map = OrderedDict(sorted(list(knob_conf_map.items()), key=lambda x: x[1][0].pk))
+    default_knob_confs = [c for c, _ in list(knob_conf_map.values())][:5]
+    LOG.debug("default_knob_confs: %s", default_knob_confs)
 
-    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, True)
+    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, session.target_objective)
     default_metrics = MetricCatalog.objects.get_default_metrics(session.target_objective)
 
     labels = Workload.get_labels()
@@ -619,7 +645,18 @@ def workload_view(request, project_id, session_id, wkld_id):
 
 
 @login_required(login_url=reverse_lazy('login'))
-def tuner_status_view(request, project_id, session_id, result_id):
+def download_next_config(request):
+    data = request.GET
+    result_id = data['id']
+    res = Result.objects.get(pk=result_id)
+    response = HttpResponse(res.next_configuration,
+                            content_type='text/plain')
+    response['Content-Disposition'] = 'attachment; filename=result_' + str(result_id) + '.cnf'
+    return response
+
+
+@login_required(login_url=reverse_lazy('login'))
+def tuner_status_view(request, project_id, session_id, result_id):  # pylint: disable=unused-argument
     res = Result.objects.get(pk=result_id)
 
     tasks = TaskUtil.get_tasks(res.task_ids)
@@ -633,8 +670,8 @@ def tuner_status_view(request, project_id, session_id, result_id):
         total_runtime = (completion_time - res.creation_time).total_seconds()
         total_runtime = '{0:.2f} seconds'.format(total_runtime)
 
-    task_info = [(tname, task) for tname, task in \
-                 zip(TaskType.TYPE_NAMES.values(), tasks)]
+    task_info = [(tname, task) for tname, task in
+                 zip(list(TaskType.TYPE_NAMES.values()), tasks)]
 
     context = {"id": result_id,
                "result": res,
@@ -665,19 +702,18 @@ def get_workload_data(request):
 
     results = Result.objects.filter(workload=workload)
     result_data = {r.pk: JSONUtil.loads(r.metric_data.data) for r in results}
-    results = sorted(results, cmp=lambda x, y: int(result_data[y.pk][MetricManager.THROUGHPUT] -
-                                                   result_data[x.pk][MetricManager.THROUGHPUT]))
+    results = sorted(results, key=lambda x: int(result_data[x.pk][MetricManager.THROUGHPUT]))
 
     default_metrics = MetricCatalog.objects.get_default_metrics(session.target_objective)
     metrics = request.GET.get('met', ','.join(default_metrics)).split(',')
     metrics = [m for m in metrics if m != 'none']
     if len(metrics) == 0:
         metrics = default_metrics
-        
+
     data_package = {'results': [],
                     'error': 'None',
                     'metrics': metrics}
-    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, True)
+    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, session.target_objective)
     for met in data_package['metrics']:
         met_info = metric_meta[met]
         data_package['results'].append({'data': [[]], 'tick': [],
@@ -707,11 +743,6 @@ def get_workload_data(request):
     return HttpResponse(JSONUtil.dumps(data_package), content_type='application/json')
 
 
-@login_required(login_url=reverse_lazy('login'))
-def update_similar(request):
-    raise Http404()
-
-
 # Data Format:
 #    error
 #    results
@@ -732,7 +763,7 @@ def get_timeline_data(request):
     ]
     data_package = {
         'error': 'None',
-        'timelines': [], 
+        'timelines': [],
         'columnnames': columnnames,
     }
 
@@ -742,54 +773,48 @@ def get_timeline_data(request):
 
     default_metrics = MetricCatalog.objects.get_default_metrics(session.target_objective)
 
-    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, True)
+    metric_meta = MetricCatalog.objects.get_metric_meta(session.dbms, session.target_objective)
     for met in default_metrics:
         met_info = metric_meta[met]
-        columnnames.append(
-            met_info.pprint + ' (' + 
-            met_info.short_unit + ')') 
+        columnnames.append(met_info.pprint + ' (' + met_info.short_unit + ')')
 
     results_per_page = int(request.GET['nres'])
 
     # Get all results related to the selected session, sort by time
-    results = Result.objects.filter(session=session)
-    results = sorted(results, cmp=lambda x, y: int(
-        (x.observation_end_time - y.observation_end_time).total_seconds()))
+    results = Result.objects.filter(session=session)\
+        .select_related('knob_data', 'metric_data', 'workload')
+    results = sorted(results, key=lambda x: x.observation_end_time)
 
     display_type = request.GET['wkld']
     if display_type == 'show_none':
         workloads = []
         metrics = default_metrics
         results = []
-        pass
     else:
-        metrics = request.GET.get(
-            'met', ','.join(default_metrics)).split(',')
+        metrics = request.GET.get('met', ','.join(default_metrics)).split(',')
         metrics = [m for m in metrics if m != 'none']
         if len(metrics) == 0:
             metrics = default_metrics
         workloads = [display_type]
-        workload_confs = filter(lambda x: x != '', request.GET[
-                                 'spe'].strip().split(','))
-        results = filter(lambda x: str(x.workload.pk)
-                         in workload_confs, results)
+        workload_confs = [wc for wc in request.GET['spe'].strip().split(',') if wc != '']
+        results = [r for r in results if str(r.workload.pk) in workload_confs]
 
     metric_datas = {r.pk: JSONUtil.loads(r.metric_data.data) for r in results}
     result_list = []
-    for r in results:
+    for res in results:
         entry = [
-            r.pk,
-            r.observation_end_time.strftime("%Y-%m-%d %H:%M:%S"),
-            r.knob_data.name,
-            r.metric_data.name,
-            r.workload.name]
+            res.pk,
+            res.observation_end_time.astimezone(timezone(TIME_ZONE)).strftime("%Y-%m-%d %H:%M:%S"),
+            res.knob_data.name,
+            res.metric_data.name,
+            res.workload.name]
         for met in metrics:
-            entry.append(metric_datas[r.pk][met] * metric_meta[met].scale)
+            entry.append(metric_datas[res.pk][met] * metric_meta[met].scale)
         entry.extend([
             '',
-            r.knob_data.pk,
-            r.metric_data.pk,
-            r.workload.pk
+            res.knob_data.pk,
+            res.metric_data.pk,
+            res.workload.pk
         ])
         result_list.append(entry)
     data_package['results'] = result_list
@@ -798,7 +823,7 @@ def get_timeline_data(request):
     for metric in metrics:
         met_info = metric_meta[metric]
         for wkld in workloads:
-            w_r = filter(lambda x: x.workload.name == wkld, results)
+            w_r = [r for r in results if r.workload.name == wkld]
             if len(w_r) == 0:
                 continue
 
@@ -813,13 +838,14 @@ def get_timeline_data(request):
             }
 
             for dbms in request.GET['dbms'].split(','):
-                d_r = filter(lambda x: x.dbms.key == dbms, w_r)
+                d_r = [r for r in w_r if r.dbms.key == dbms]
                 d_r = d_r[-results_per_page:]
                 out = []
                 for res in d_r:
                     metric_data = JSONUtil.loads(res.metric_data.data)
                     out.append([
-                        res.observation_end_time.strftime("%m-%d-%y %H:%M"),
+                        res.observation_end_time.astimezone(timezone(TIME_ZONE)).
+                        strftime("%m-%d-%y %H:%M"),
                         metric_data[metric] * met_info.scale,
                         "",
                         str(res.pk)
@@ -831,3 +857,27 @@ def get_timeline_data(request):
             data_package['timelines'].append(data)
 
     return HttpResponse(JSONUtil.dumps(data_package), content_type='application/json')
+
+
+# get the lastest result
+def give_result(request, upload_code):  # pylint: disable=unused-argument
+    try:
+        session = Session.objects.get(upload_code=upload_code)
+    except Session.DoesNotExist:
+        LOG.warning("Invalid upload code: %s", upload_code)
+        return HttpResponse("Invalid upload code: " + upload_code)
+    results = Result.objects.filter(session=session)
+    lastest_result = results[len(results) - 1]
+
+    tasks = TaskUtil.get_tasks(lastest_result.task_ids)
+    overall_status, _ = TaskUtil.get_task_status(tasks)
+
+    if overall_status in ['PENDING', 'RECEIVED', 'STARTED']:
+        return HttpResponse("Result not ready")
+    # unclear behaviors for REVOKED and RETRY, treat as failure
+    elif overall_status in ['FAILURE', 'REVOKED', 'RETRY']:
+        return HttpResponse("Fail")
+
+    # success
+    res = Result.objects.get(pk=lastest_result.pk)
+    return HttpResponse(JSONUtil.dumps(res.next_configuration), content_type='application/json')

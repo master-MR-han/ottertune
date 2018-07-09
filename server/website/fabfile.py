@@ -1,14 +1,22 @@
+#
+# OtterTune - fabfile.py
+#
+# Copyright (c) 2017-18, Carnegie Mellon University Database Group
+#
 '''
 Admin tasks
 
 @author: dvanaken
 '''
 
+import logging
 from collections import namedtuple
 from fabric.api import env, local, quiet, settings, task
 from fabric.state import output as fabric_output
 
 from website.settings import DATABASES, PROJECT_ROOT
+
+LOG = logging.getLogger(__name__)
 
 
 # Fabric environment settings
@@ -21,22 +29,9 @@ fabric_output.update({
 Status = namedtuple('Status', ['RUNNING', 'STOPPED'])
 STATUS = Status(0, 1)
 
-if local('hostname', capture=True).strip() == 'ottertune':
-    PREFIX = 'sudo -u celery '
-    SUPERVISOR_CONFIG = '-c config/prod_supervisord.conf'
-else:
-    PREFIX = ''
-    SUPERVISOR_CONFIG = '-c config/supervisord.conf'
-
 
 # Setup and base commands
-SUPERVISOR_CMD = (PREFIX + 'supervisorctl ' + SUPERVISOR_CONFIG +
-                  ' {action} celeryd').format
 RABBITMQ_CMD = 'sudo rabbitmqctl {action}'.format
-
-# Make sure supervisor is initialized
-with settings(warn_only=True), quiet():
-    local(PREFIX + 'supervisord ' + SUPERVISOR_CONFIG)
 
 
 @task
@@ -62,48 +57,27 @@ def status_rabbitmq():
         status = STATUS.RUNNING
     else:
         raise Exception("Rabbitmq: unknown status " + str(res.return_code))
-    print status
-    print_status(status, 'rabbitmq')
+    log_status(status, 'rabbitmq')
     return status
 
 
 @task
-def start_celery(detached=True):
+def start_celery():
     if status_rabbitmq() == STATUS.STOPPED:
         start_rabbitmq()
-    detached = parse_bool(detached)
-    if detached:
-        local(SUPERVISOR_CMD(action='start'))
-    else:
-        local(PREFIX + 'python manage.py celery worker -l info')
+    local('python manage.py celery worker --detach --loglevel=info --pool=threads')
 
 
 @task
 def stop_celery():
-    local(SUPERVISOR_CMD(action='stop'))
-
-
-@task
-def status_celery():
-    res = local(SUPERVISOR_CMD(action='status') +
-                ' | tr -s \' \' | cut -d \' \' -f2', capture=True)
-    try:
-        status = STATUS._asdict()[res.stdout]
-    except KeyError as e:
-        if res.stdout == 'STARTING':
-            status = STATUS.RUNNING
-        elif res.stdout == 'FATAL':
-            status = STATUS.STOPPED
-        else:
-            raise e
-    print_status(status, 'celery')
-    return status
+    with settings(warn_only=True), quiet():
+        local('kill -9 `ps auxww | grep \'celery worker\' | awk \'{print $2}\'`')
 
 
 @task
 def start_debug_server(host="0.0.0.0", port=8000):
-    if status_celery() == STATUS.STOPPED:
-        start_celery()
+    stop_celery()
+    start_celery()
     local('python manage.py runserver {}:{}'.format(host, port))
 
 
@@ -122,10 +96,8 @@ def parse_bool(value):
         raise Exception('Cannot convert {} to bool'.format(type(value)))
 
 
-def print_status(status, task_name):
-    print "{} status: {}".format(
-        task_name,
-        STATUS._fields[STATUS.index(status)])
+def log_status(status, task_name):
+    LOG.info("%s status: %s", task_name, STATUS._fields[STATUS.index(status)])
 
 
 @task
@@ -138,9 +110,9 @@ def reset_website():
     passwd = DATABASES['default']['PASSWORD']
     name = DATABASES['default']['NAME']
     local("mysql -u {} -p{} -N -B -e \"DROP DATABASE IF EXISTS {}\"".format(
-            user, passwd, name))
+        user, passwd, name))
     local("mysql -u {} -p{} -N -B -e \"CREATE DATABASE {}\"".format(
-            user, passwd, name))
+        user, passwd, name))
 
     # Reinitialize the website
     local('python manage.py migrate website')
@@ -174,7 +146,7 @@ def generate_and_load_data(n_workload, n_samples_per_workload, upload_code,
     local('python script/controller_simulator/data_generator.py {} {} {}'.format(
         n_workload, n_samples_per_workload, random_seed))
     local(('python script/controller_simulator/upload_data.py '
-          'script/controller_simulator/generated_data {}').format(upload_code))
+           'script/controller_simulator/generated_data {}').format(upload_code))
 
 
 @task
@@ -182,7 +154,7 @@ def dumpdata(dumppath):
     # Helper function for calling Django's loaddata function that excludes
     # the static fixture data from being dumped
     excluded_models = ['DBMSCatalog', 'KnobCatalog', 'MetricCatalog', 'Hardware']
-    cmd = 'python manage.py dumpdata'
+    cmd = 'python manage.py dumpdata --natural-foreign --natural-primary'
     for model in excluded_models:
         cmd += ' --exclude website.' + model
     cmd += ' > ' + dumppath
@@ -194,7 +166,6 @@ def run_background_tasks():
     # Runs the background tasks just once.
     cmd = ("from website.tasks import run_background_tasks; "
            "run_background_tasks()")
-    local(('export PYTHONPATH={}\:$PYTHONPATH; '
+    local(('export PYTHONPATH={}\:$PYTHONPATH; '  # pylint: disable=anomalous-backslash-in-string
            'django-admin shell --settings=website.settings '
            '-c\"{}\"').format(PROJECT_ROOT, cmd))
-

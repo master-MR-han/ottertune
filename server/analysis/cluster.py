@@ -1,17 +1,31 @@
+#
+# OtterTune - cluster.py
+#
+# Copyright (c) 2017-18, Carnegie Mellon University Database Group
+#
 '''
 Created on Jul 4, 2016
 
 @author: dva
 '''
-
-import copy
-import numpy as np
 from abc import ABCMeta, abstractproperty
 from collections import OrderedDict
+
+import os
+import json
+import copy
+import numpy as np
+import matplotlib.pyplot as plt
+
 from scipy.spatial.distance import cdist
+from sklearn.metrics import silhouette_score
 from sklearn.cluster import KMeans as SklearnKMeans
+from celery.utils.log import get_task_logger
 
 from .base import ModelBase
+
+# Log debug messages
+LOGGER = get_task_logger(__name__)
 
 
 class KMeans(ModelBase):
@@ -57,7 +71,10 @@ class KMeans(ModelBase):
     SAMPLE_CUTOFF_ = 1000
 
     def __init__(self):
-        self._reset()
+        self.model_ = None
+        self.n_clusters_ = None
+        self.sample_labels_ = None
+        self.sample_distances_ = None
 
     @property
     def cluster_inertia_(self):
@@ -128,7 +145,7 @@ class KMeans(ModelBase):
             member_rows = X[self.cluster_labels_ == cluster_label, :]
             member_labels = self.sample_labels_[self.cluster_labels_ == cluster_label]
             centroid = np.expand_dims(self.cluster_centers_[cluster_label], axis=0)
-            
+
             # "All clusters must have at least 1 member!"
             if member_rows.shape[0] == 0:
                 return None
@@ -164,7 +181,17 @@ class KMeans(ModelBase):
         if self.sample_distances_ is None:
             raise Exception("No model has been fit yet!")
 
-        return [samples['sample_labels'][0] for samples in self.sample_distances_.values()]
+        return [samples['sample_labels'][0] for samples in list(self.sample_distances_.values())]
+
+    def get_memberships(self):
+        '''
+        Return the memberships in each cluster
+        '''
+        memberships = OrderedDict()
+        for cluster_label, samples in list(self.sample_distances_.items()):
+            memberships[cluster_label] = OrderedDict(
+                [(l, d) for l, d in zip(samples["sample_labels"], samples["distances"])])
+        return json.dumps(memberships, indent=4)
 
 
 class KMeansClusters(ModelBase):
@@ -192,7 +219,10 @@ class KMeansClusters(ModelBase):
     """
 
     def __init__(self):
-        self._reset()
+        self.min_cluster_ = None
+        self.max_cluster_ = None
+        self.cluster_map_ = None
+        self.sample_labels_ = None
 
     def _reset(self):
         """Resets all attributes (erases the model)"""
@@ -234,18 +264,58 @@ class KMeansClusters(ModelBase):
             sample_labels = ["sample_{}".format(i) for i in range(X.shape[1])]
         self.sample_labels_ = sample_labels
         for K in range(self.min_cluster_, self.max_cluster_ + 1):
-            tmp = KMeans().fit(X, K, self.sample_labels_,estimator_params)
-            if tmp is None: #Set maximum cluster
-                assert K > min_cluster, "min_cluster is too large for the model" 
-                self.max_cluster_ = K-1
+            tmp = KMeans().fit(X, K, self.sample_labels_, estimator_params)
+            if tmp is None:  # Set maximum cluster
+                assert K > min_cluster, "min_cluster is too large for the model"
+                self.max_cluster_ = K - 1
                 break
             else:
                 self.cluster_map_[K] = tmp
 
         return self
 
+    def save(self, savedir):
+        """Saves the KMeans model results
 
-class KSelection(ModelBase):
+        Parameters
+        ----------
+        savedir : string
+                  Path to the directory to save the results in.
+        """
+        if self.cluster_map_ is None:
+            raise Exception("No models have been fitted yet!")
+
+        cluster_map = OrderedDict()
+        inertias = []
+        for K, model in sorted(self.cluster_map_.items()):
+            cluster_map[K] = {
+                "cluster_inertia": model.cluster_inertia_,
+                "cluster_labels": model.cluster_labels_,
+                "cluster_centers": model.cluster_centers_,
+            }
+            inertias.append(model.cluster_inertia_)
+
+        # Save sum of squares plot (elbow curve)
+        fig = plt.figure()
+        plt.plot(list(cluster_map.keys()), inertias, '--o')
+        plt.xlabel("Number of clusters (K)")
+        plt.ylabel("Within sum of squares W_k")
+        plt.title("Within Sum of Squares vs. Number of Clusters")
+        fig.canvas.set_window_title(os.path.basename(savedir))
+        savepath = os.path.join(savedir, "kmeans_sum_of_squares.pdf")
+        plt.savefig(savepath, bbox_inches="tight")
+        plt.close()
+
+        # save cluster memberships
+        for K in range(self.min_cluster_, self.max_cluster_ + 1):
+            savepath = os.path.join(savedir,
+                                    "memberships_{}-clusters.json".format(K))
+            members = self.cluster_map_[K].get_memberships()
+            with open(savepath, "w") as f:
+                f.write(members)
+
+
+class KSelection(ModelBase, metaclass=ABCMeta):
     """KSelection:
 
     Abstract class for techniques that approximate the optimal
@@ -266,10 +336,9 @@ class KSelection(ModelBase):
 
     NAME_ = None
 
-    __metaclass__ = ABCMeta
-
     def __init__(self):
-        self._reset()
+        self.optimal_num_clusters_ = None
+        self.clusters_ = None
 
     def _reset(self):
         """Resets all attributes (erases the model)"""
@@ -279,6 +348,22 @@ class KSelection(ModelBase):
     @abstractproperty
     def name_(self):
         pass
+
+    def save(self, savedir):
+        """Saves the estimation of the optimal # of clusters.
+
+        Parameters
+        ----------
+        savedir : string
+                  Path to the directory to save the results in.
+        """
+        if self.optimal_num_clusters_ is None:
+            raise Exception("Optimal number of clusters has not been computed!")
+
+        # Save the computed optimal number of clusters
+        savepath = os.path.join(savedir, self.name_ + "_optimal_num_clusters.txt")
+        with open(savepath, "w") as f:
+            f.write(str(self.optimal_num_clusters_))
 
 
 class GapStatistic(KSelection):
@@ -304,21 +389,24 @@ class GapStatistic(KSelection):
     name_ : string
             The name of this technique
 
-    logWks_ : array, [n_clusters]
-              The within-dispersion measures of X (log)
+    log_wks_ : array, [n_clusters]
+               The within-dispersion measures of X (log)
 
-    logWkbs_ : array, [n_clusters]
-               The within-dispersion measures of the generated
-               reference data sets
+    log_wkbs_ : array, [n_clusters]
+                The within-dispersion measures of the generated
+                reference data sets
 
     khats_ : array, [n_clusters]
              The gap-statistic for each cluster
     """
 
     NAME_ = "gap-statistic"
-    
+
     def __init__(self):
         super(GapStatistic, self).__init__()
+        self.log_wks_ = None
+        self.log_wkbs_ = None
+        self.khats_ = None
 
     @property
     def name_(self):
@@ -327,11 +415,11 @@ class GapStatistic(KSelection):
     def _reset(self):
         """Resets all attributes (erases the model)"""
         super(GapStatistic, self)._reset()
-        self.logWks_ = None
-        self.logWkbs_ = None
+        self.log_wks_ = None
+        self.log_wkbs_ = None
         self.khats_ = None
 
-    def fit(self, X, cluster_map, n_B=50):
+    def fit(self, X, cluster_map, n_b=50):
         """Estimates the optimal number of clusters (K) for a
            KMeans model trained on X.
 
@@ -357,41 +445,44 @@ class GapStatistic(KSelection):
         n_clusters = len(cluster_map)
 
         # Dispersion for real distribution
-        logWks = np.zeros(n_clusters)
-        logWkbs = np.zeros(n_clusters)
+        log_wks = np.zeros(n_clusters)
+        log_wkbs = np.zeros(n_clusters)
         sk = np.zeros(n_clusters)
-        for indk, (K, model) in enumerate(sorted(cluster_map.iteritems())):
-            logWks[indk] = np.log(GapStatistic.Wk(X,
-                                                  model.cluster_centers_,
-                                                  model.cluster_labels_))
+        for indk, (K, model) in enumerate(sorted(cluster_map.items())):
+
+            # Computes Wk: the within-dispersion of each cluster size (k)
+            log_wks[indk] = np.log(model.cluster_inertia_ / (2.0 * K))
 
             # Create B reference datasets
-            logBWkbs = np.zeros(n_B)
-            for i in range(n_B):
+            log_bwkbs = np.zeros(n_b)
+            for i in range(n_b):
                 Xb = np.empty_like(X)
                 for j in range(X.shape[1]):
                     Xb[:, j] = np.random.uniform(mins[j], maxs[j], size=X.shape[0])
                 Xb_model = KMeans().fit(Xb, K)
-                logBWkbs[i] = np.log(GapStatistic.Wk(Xb,
-                                                     Xb_model.cluster_centers_,
-                                                     Xb_model.cluster_labels_))
-            logWkbs[indk] = sum(logBWkbs) / n_B
-            sk[indk] = np.sqrt(sum((logBWkbs-logWkbs[indk])**2) / n_B)
-        sk = sk * np.sqrt(1 + 1.0 / n_B)
+                log_bwkbs[i] = np.log(Xb_model.cluster_inertia_ / (2.0 * K))
+            log_wkbs[indk] = sum(log_bwkbs) / n_b
+            sk[indk] = np.sqrt(sum((log_bwkbs - log_wkbs[indk]) ** 2) / n_b)
+        sk = sk * np.sqrt(1 + 1.0 / n_b)
 
         khats = np.zeros(n_clusters)
-        gaps = logWkbs - logWks
+        gaps = log_wkbs - log_wks
         gsks = gaps - sk
+        khats[1:] = gaps[0:-1] - gsks[1:]
         self.clusters_ = np.array(sorted(cluster_map.keys()))
-        for i in range(1, n_clusters):
-            khats[i] = gaps[i-1] - gsks[i]
-            if self.optimal_num_clusters_ is None and gaps[i-1] >= gsks[i]:
-                self.optimal_num_clusters_ = self.clusters_[i-1]
-        if self.optimal_num_clusters_ is None:
-            self.optimal_num_clusters_ = 0
 
-        self.logWks_ = logWks
-        self.logWkbs_ = logWkbs
+        for i in range(1, n_clusters):
+            if gaps[i - 1] >= gsks[i]:
+                self.optimal_num_clusters_ = self.clusters_[i - 1]
+                break
+
+        if self.optimal_num_clusters_ is None:
+            LOGGER.info("GapStatistic NOT found the optimal k, \
+                        use the last(maximum) k instead ")
+            self.optimal_num_clusters_ = self.clusters_[-1]
+
+        self.log_wks_ = log_wks
+        self.log_wkbs_ = log_wkbs
         self.khats_ = khats
         return self
 
@@ -434,9 +525,41 @@ class GapStatistic(KSelection):
         The within-dispersion of each cluster (K)
         """
         K = len(mu)
-        return sum([np.linalg.norm(mu[i]-x)**2
+        return sum([np.linalg.norm(mu[i] - x) ** 2 / (2.0 * K)
                     for i in range(K)
                     for x in X[cluster_labels == i]])
+
+    def save(self, savedir):
+        """Saves the estimation results of the optimal # of clusters.
+
+        Parameters
+        ----------
+        savedir : string
+                  Path to the directory to save the results in.
+        """
+        super(GapStatistic, self).save(savedir)
+
+        # Plot the calculated gap
+        gaps = self.log_wkbs_ - self.log_wks_
+        fig = plt.figure()
+        plt.plot(self.clusters_, gaps, '--o')
+        plt.title("Gap vs. Number of Clusters")
+        plt.xlabel("Number of clusters (K)")
+        plt.ylabel("gap_K")
+        fig.canvas.set_window_title(os.path.basename(savedir))
+        plt.savefig(os.path.join(savedir, self.name_ + ".pdf"), bbox_inches="tight")
+        plt.close()
+
+        # Plot the gap statistic
+        fig = plt.figure()
+        plt.bar(self.clusters_, self.khats_)
+        plt.title("Gap Statistic vs. Number of Clusters")
+        plt.xlabel("Number of clusters (K)")
+        plt.ylabel("gap(K)-(gap(K+1)-s(K+1))")
+        fig.canvas.set_window_title(os.path.basename(savedir))
+        plt.savefig(os.path.join(savedir, self.name_ + "_final.pdf"),
+                    bbox_inches="tight")
+        plt.close()
 
 
 class DetK(KSelection):
@@ -462,7 +585,7 @@ class DetK(KSelection):
     name_ : string
             The name of this technique
 
-    Fs_ : array, [n_clusters]
+    fs_ : array, [n_clusters]
           The computed evaluation functions F(K) for each cluster size K
     """
 
@@ -470,6 +593,7 @@ class DetK(KSelection):
 
     def __init__(self):
         super(DetK, self).__init__()
+        self.fs_ = None
 
     @property
     def name_(self):
@@ -478,7 +602,7 @@ class DetK(KSelection):
     def _reset(self):
         """Resets all attributes (erases the model)"""
         super(DetK, self)._reset()
-        self.Fs_ = None
+        self.fs_ = None
 
     def fit(self, X, cluster_map):
         """Estimates the optimal number of clusters (K) for a
@@ -500,30 +624,148 @@ class DetK(KSelection):
         """
         self._reset()
         n_clusters = len(cluster_map)
-        Nd = X.shape[1]
-        Fs = np.empty(n_clusters)
-        Sks = np.empty(n_clusters)
-        a = {}
+        nd = X.shape[1]
+        fs = np.empty(n_clusters)
+        sks = np.empty(n_clusters)
+        alpha = {}
         # K from 1 to maximum_cluster_
         for i, (K, model) \
-                in enumerate(sorted(cluster_map.iteritems())):
-            #compute a(K,Nd) (i.e. a[K]) 
+                in enumerate(sorted(cluster_map.items())):
+            # Compute alpha(K, nd) (i.e. alpha[K])
             if K == 2:
-                a[K] = 1 - 3.0 / (4 * Nd)
+                alpha[K] = 1 - 3.0 / (4 * nd)
             elif K > 2:
-                a[K] = a[K - 1] + (1 - a[K - 1]) / 6.0
-            Sks[i] = model.cluster_inertia_ 
-            
+                alpha[K] = alpha[K - 1] + (1 - alpha[K - 1]) / 6.0
+            sks[i] = model.cluster_inertia_
+
             if K == 1:
-                Fs[i] = 1
-            elif Sks[i - 1] == 0:
-                Fs[i] = 1
+                fs[i] = 1
+            elif sks[i - 1] == 0:
+                fs[i] = 1
             else:
-                Fs[i] = Sks[i] / (a[K] * Sks[i - 1])
+                fs[i] = sks[i] / (alpha[K] * sks[i - 1])
         self.clusters_ = np.array(sorted(cluster_map.keys()))
-        self.optimal_num_clusters_ = self.clusters_[np.argmin(Fs)]
-        self.Fs_ = Fs
+        self.optimal_num_clusters_ = self.clusters_[np.argmin(fs)]
+        self.fs_ = fs
         return self
+
+    def save(self, savedir):
+        """Saves the estimation results of the optimal # of clusters.
+
+        Parameters
+        ----------
+        savedir : string
+                  Path to the directory to save the results in.
+        """
+        super(DetK, self).save(savedir)
+
+        # Plot the evaluation function
+        fig = plt.figure()
+        plt.plot(self.clusters_, self.fs_, '--o')
+        plt.xlabel("Number of clusters (K)")
+        plt.ylabel("Evaluation function (F_k)")
+        plt.title("Evaluation Function vs. Number of Clusters")
+        fig.canvas.set_window_title(os.path.basename(savedir))
+        savepath = os.path.join(savedir, self.name_ + "_eval_function.pdf")
+        plt.savefig(savepath, bbox_inches="tight")
+        plt.close()
+
+
+class Silhouette(KSelection):
+    """Det:
+
+    Approximates the optimal number of clusters (K).
+
+
+    References
+    ----------
+    http://scikit-learn.org/stable/modules/generated/sklearn.metrics.silhouette_score.html
+
+
+    Attributes
+    ----------
+    optimal_num_clusters_ : int
+                            An estimation of the optimal number of clusters K for
+                            KMeans models fit to X
+
+    clusters_ : array, [n_clusters]
+                The sizes of the clusters
+
+    name_ : string
+            The name of this technique
+
+    Score_ : array, [n_clusters]
+            The mean Silhouette Coefficient for each cluster size K
+    """
+
+    # short for Silhouette score
+    NAME_ = "s-score"
+
+    def __init__(self):
+        super(Silhouette, self).__init__()
+        self.scores_ = None
+
+    @property
+    def name_(self):
+        return Silhouette.NAME_
+
+    def _reset(self):
+        """Resets all attributes (erases the model)"""
+        super(Silhouette, self)._reset()
+        self.scores_ = None
+
+    def fit(self, X, cluster_map):
+        """Estimates the optimal number of clusters (K) for a
+           KMeans model trained on X.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Training data.
+
+        cluster_map_ : dict
+                       A dictionary mapping each cluster size (K) to the KMeans
+                       model fitted to X with K clusters
+
+        Returns
+        -------
+        self
+        """
+        self._reset()
+        n_clusters = len(cluster_map)
+        # scores = np.empty(n_clusters)
+        scores = np.zeros(n_clusters)
+        for i, (K, model) \
+                in enumerate(sorted(cluster_map.items())):
+            if K <= 1:  # K >= 2
+                continue
+            scores[i] = silhouette_score(X, model.cluster_labels_)
+
+        self.clusters_ = np.array(sorted(cluster_map.keys()))
+        self.optimal_num_clusters_ = self.clusters_[np.argmax(scores)]
+        self.scores_ = scores
+        return self
+
+    def save(self, savedir):
+        """Saves the estimation results of the optimal # of clusters.
+
+        Parameters
+        ----------
+        savedir : string
+                  Path to the directory to save the results in.
+        """
+        super(Silhouette, self).save(savedir)
+
+        # Plot the evaluation function
+        fig = plt.figure()
+        plt.plot(self.clusters_, self.scores_, '--o')
+        plt.xlabel("Number of clusters (K)")
+        plt.ylabel("Silhouette scores")
+        plt.title("Silhouette Scores vs. Number of Clusters")
+        fig.canvas.set_window_title(os.path.basename(savedir))
+        savepath = os.path.join(savedir, self.name_ + "_eval_function.pdf")
+        plt.savefig(savepath, bbox_inches="tight")
+        plt.close()
 
 
 def create_kselection_model(model_name):
@@ -533,7 +775,7 @@ def create_kselection_model(model_name):
     ----------
     model_name : string
                  Name of the KSelection model.
-                 One of ['gap-statistic', 'det-k']
+                 One of ['gap-statistic', 'det-k', 's-score']
 
 
     Returns
@@ -543,6 +785,7 @@ def create_kselection_model(model_name):
     kselection_map = {
         DetK.NAME_: DetK,
         GapStatistic.NAME_: GapStatistic,
+        Silhouette.NAME_: Silhouette
     }
     if model_name not in kselection_map:
         raise Exception("KSelection model {} not supported!".format(model_name))

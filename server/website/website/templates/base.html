@@ -45,7 +45,9 @@
   width: 150px;
 }
 </style>
-{% block extra_head %}{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="{{ STATIC_URL }}css/style.css">
+{% endblock %}
 </head>
 
 <body>
@@ -60,6 +62,7 @@
         <div class="navbar-right">
             {% if user.is_authenticated %}
             <span class="navbar-text">Hello, {{ user.username }}</span>
+            <a class="btn btn-default navbar-btn2" href="{% url 'change_password' %}">Change Password</a>
             <a class="btn btn-default navbar-btn2" href="{% url 'logout' %}">Sign Out</a>
             {% else %}
             <form class="form-inline navbar-form2" role="form" action="{% url 'login' %}" method="POST" style="margin:0 0 0 0">
@@ -74,7 +77,7 @@
 </div>
 </div>
 </nav>
-	
+
 	{% if form.errors %}
 	{% for field in form %}
 	{% for error in field.errors %}
